@@ -1,0 +1,359 @@
+---
+title: "Лабораторная работа № 2. Импорт и профилирование данных"
+author: "Забродин В.А., 02271-ДМ"
+lang: ru
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(visdat)
+library(DataExplorer)
+library(lubridate)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 10, fig.height = 5,
+                      dpi = 110, warning = TRUE, message = FALSE)
+set.seed(42)
+options(tibble.width = Inf)
+kt <- function(x, caption = NULL) knitr::kable(x, digits = 3, caption = caption)
+air_path <- 'data/raw/AirQualityUCI.csv'
+water_path <- 'data/raw/water.csv'
+```
+
+# Изучение сырого файла
+
+```{r raw-inspection}
+air_lines <- read_lines(air_path)
+read_lines(air_path, n_max = 5)
+head(read_lines(air_path, skip = 9355), 10)
+tail(air_lines, 5)
+air_encoding <- guess_encoding(air_path)
+air_encoding
+header <- str_split(air_lines[1], fixed(';'))[[1]]
+empty_text <- str_detect(air_lines[-1], '^[;[:space:]]*$')
+sentinel_tokens <- str_count(air_lines[-1], '(?<=;)-200(?:,0+)?(?=;|$)')
+kt(tibble(
+  Параметр = c('Разделитель', 'Десятичный знак', 'Кодировка',
+                'Служебные строки перед таблицей', 'Значения пропусков',
+                'Пустые записи', 'Пустые имена в заголовке'),
+  Значение = c(';', ',', paste(air_encoding$encoding, collapse = ', '),
+                '0', '-200, пустое поле; NA',
+                as.character(sum(empty_text)), as.character(sum(header == ''))),
+  Подтверждение = c('Первые строки', 'Числа вида 2,6 в первой записи',
+                     'guess_encoding(); ASCII совместим с UTF-8',
+                     'Заголовок начинается с Date',
+                     paste('В тексте ', sum(sentinel_tokens), ' токенов'),
+                     'Проверка строк, состоящих из ; и пробелов',
+                     'Разбиение первой строки по ;')
+))
+```
+# Импорт основного набора
+
+```{r air-import}
+df_raw <- read_csv2(
+  air_path,
+  locale = locale(decimal_mark = ',', grouping_mark = '.', encoding = 'UTF-8'),
+  na = c('', 'NA', '-200', '-200,0', '-200,00', '-200,000', '-200,0000'),
+  col_types = cols(Date = col_character(), Time = col_character(),
+                   .default = col_double()),
+  skip_empty_rows = FALSE,
+  name_repair = 'unique',
+  show_col_types = FALSE
+)
+glimpse(df_raw)
+spec(df_raw)
+air_problems <- problems(df_raw)
+air_problems
+```
+
+Число ошибок разбора: **`r nrow(air_problems)`**
+
+`glimpse()` показывает `r nrow(df_raw)` строк и `r ncol(df_raw)` столбцов. Дата и время прочитаны как текст, а измерения — как числа. `spec()` подтверждает типы. Пустые заголовки получили технические имена, вроде `...16` и `...17`
+
+| Параметр | Назначение | Что произошло бы без него |
+|---|---|---|
+| `air_path` | Путь к исходному файлу | Файл не был бы найден без корректного пути |
+| `read_csv2()` | Разделитель `;` и десятичная запятая | Обычный `read_csv()` мог бы неверно разбить строки |
+| `locale()` | Десятичная запятая, точка для группировки разрядов, UTF-8 | Неверная локаль может исказить дробные числа или текст; здесь параметры явно фиксируют формат |
+| `na` | Пустые поля, `NA`, `-200` и его десятичные формы | Код -200 попал бы в расчёты как реальное число |
+| `col_types` | `Date` и `Time` — текст, остальные столбцы — double | Автоматическое распознавание может выбрать неподходящие типы |
+| `skip_empty_rows = FALSE` | Сохраняет пустые записи для диагностики | Пустые строки могли бы исчезнуть уже при чтении |
+| `name_repair = "unique"` | Уникальные имена, в том числе для пустых заголовков | При отсутствии восстановления имён возможны пустые или повторяющиеся имена; unique также является стандартным режимом |
+| `show_col_types = FALSE` | Отключает служебное сообщение | Изменился бы только вывод, не данные |
+
+Интерпретация `problems()`: `r if (nrow(air_problems) == 0) "ошибок синтаксического разбора не обнаружено" else "обнаружены ошибки разбора"`
+
+```{r sentinel-audit}
+air_audit <- read_csv2(air_path,
+  locale = locale(decimal_mark = ',', encoding = 'UTF-8'),
+  na = c('', 'NA'), col_types = cols(Date = col_character(),
+  Time = col_character(), .default = col_double()),
+  skip_empty_rows = FALSE, show_col_types = FALSE)
+sentinel_counts <- air_audit |>
+  summarise(across(where(is.numeric), ~ sum(.x == -200, na.rm = TRUE))) |>
+  pivot_longer(everything(), names_to = 'column', values_to = 'n') |>
+  filter(n > 0) |> arrange(desc(n))
+kt(sentinel_counts, 'Количество скрытых кодов -200 до распознавания NA')
+```
+
+Повторное чтение без распознавания `-200` показывает, сколько скрытых пропусков содержалось в показателях: всего `r sum(sentinel_counts$n)` значений
+
+
+# Файл с проблемной кодировкой
+
+```{r water-before, error=TRUE}
+water_bad <- read_csv(water_path, show_col_types = FALSE)
+head(water_bad, 5)
+```
+
+При чтении с настройками по умолчанию кириллица интерпретируется как UTF-8, а файл записан в KOI8-R
+
+```{r water-preview}
+raw_lines <- readLines(water_path, n = 8, encoding = "bytes")[4:8]
+
+iconv(raw_lines, from = "UTF-8", to = "UTF-8", sub = "byte")
+```
+```{r water-inspect}
+guess_encoding(water_path)
+
+water_lines <- read_lines(
+  water_path,
+  locale = locale(encoding = "KOI8-R")
+)
+
+head(water_lines, 5)
+tail(water_lines, 3)
+```
+```{r water-after}
+water <- read_csv(
+  water_path,
+  locale = locale(
+    encoding = "KOI8-R",
+    decimal_mark = "."
+  ),
+  skip = 2,
+  comment = "",
+  n_max = 30,
+  na = c("", "NA", "-", "нет"),
+  show_col_types = FALSE
+)
+
+kt(head(water, 5), "Данные после импорта")
+
+glimpse(water)
+problems(water)
+```
+| Параметр | Значение | Назначение |
+|---|---|---|
+| `encoding` | KOI8-R | Корректное чтение кириллицы |
+| `decimal_mark` | Точка | Чтение дробных чисел |
+| `skip` | 2 | Пропуск служебных строк |
+| `comment` | Пустая строка | Отсутствие префикса комментариев |
+| `n_max` | 30 | Исключение итоговой строки |
+| `na` | Пусто, NA, -, нет | Распознавание обозначений отсутствующих измерений |
+| `show_col_types` | FALSE | Отключение служебного сообщения |
+
+# Имена, пустые строки и типы
+
+```{r tidy}
+air_named <- clean_names(df_raw)
+kt(tibble(
+  `Имя до` = names(df_raw),
+  `Имя после` = names(air_named)
+))
+air_tidy <- remove_empty(air_named, c("rows", "cols"))
+df <- air_tidy |>
+  mutate(stamp = parse_date_time(paste(date, time), "dmY HMS", tz = "UTC")) |>
+  select(stamp, everything(), -date, -time)
+kt(tibble(
+  Этап = c("Импорт", "Удаление пустых записей", "Объединенных дат"),
+  Строк = c(nrow(df_raw), nrow(air_tidy), nrow(df)),
+  Столбцов = c(ncol(df_raw), ncol(air_tidy), ncol(df))
+))
+sum(is.na(df$stamp))
+air_tidy |> filter(is.na(df$stamp)) |> select(date, time)
+glimpse(df)
+```
+
+`clean_names()` приводит названия к snake_case, `remove_empty()` удаляет только полностью пустые строки и столбцы
+
+Дата в формате DD/MM/YYYY и время HH.MM.SS объединены в `stamp`, часовой пояс UTC принят как единый. После объединения получено `r nrow(df)` строк и `r ncol(df)` столбцов, в типе времени — `r sum(is.na(df$stamp))` пропусков. `r if (sum(is.na(df$stamp)) == 0) "Все оставшиеся даты и время преобразованы успешно." else "Строки с непреобразованными метками приведены выше."` Итоговый `glimpse()` позволяет проверить, что измерения остались числовыми
+
+# Результаты профилирования
+
+## skimr
+
+```{r skim}
+skim(df)
+completeness <- tibble(
+  Столбец = names(df),
+  Пропусков = colSums(is.na(df)),
+  Доля = round(100 * colMeans(is.na(df)), 2)
+) |>
+  arrange(desc(Доля)) |>
+  mutate(Комментарий = case_when(
+    Пропусков == 0 ~ "Пропусков нет",
+    Доля >= 50 ~ "Высокая неполнота",
+    TRUE ~ "Есть пропуски"
+  ))
+kt(completeness |> rename(`Доля пропусков, %` = Доля), "Полнота")
+sum(complete.cases(df))
+```
+
+`skim()` показывает число пропусков, долю заполненных значений, среднее, стандартное отклонение и квантили числовых показателей. Самый неполный показатель — **`r completeness$Столбец[1]`**: `r completeness$Пропусков[1]` пропусков (`r completeness$Доля[1]` %). Полностью заполнены `r sum(complete.cases(df))` из `r nrow(df)` наблюдений. Если бы мы удаляли все строки с NA, то исключили бы `r round(100 * mean(!complete.cases(df)), 2)` % записей
+
+## Карта типов данных
+
+```{r types-plot, fig.height=5}
+vis_dat(df)
+```
+
+`vis_dat()` визуализирует типы ячеек и пропуски. На графике можно различить время и числовые столбцы измерений
+
+## Карта пропусков
+
+```{r missing-plot, fig.height=5}
+vis_miss(df)
+```
+
+`vis_miss()` показывает расположение NA. Вертикальные полосы отражают неполноту показателей, а горизонтальные - совместное отсутствие нескольких измерений. Больше всего пропусков у `r completeness$Столбец[1]`
+
+## Проверка диапазонов
+
+```{r ranges}
+vis_expect(df |> select(where(is.numeric), -t), ~ .x < 0)
+ranges <- df |>
+  select(where(is.numeric)) |>
+  pivot_longer(everything(), names_to = "Столбец", values_to = "Значение") |>
+  group_by(Столбец) |>
+  summarise(
+    Минимум = min(Значение, na.rm = TRUE),
+    Максимум = max(Значение, na.rm = TRUE),
+    Q1 = quantile(Значение, 0.25, na.rm = TRUE),
+    Q3 = quantile(Значение, 0.75, na.rm = TRUE),
+    Выбросы = sum(
+      Значение < Q1 - 1.5 * (Q3 - Q1) |
+      Значение > Q3 + 1.5 * (Q3 - Q1),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+kt(ranges, "Диапазоны измерений")
+invalid_ranges <- ranges |>
+  filter((Столбец != "t" & Минимум < 0) |
+         (Столбец == "rh" & Максимум > 100))
+kt(invalid_ranges, "Нарушения проверяемых диапазонов")
+kt(ranges |> filter(Выбросы > 0), "Подозрительные диапазоны по IQR")
+```
+## Дубликаты, категории и временная согласованность
+
+```{r duplicate-check}
+full_dupes <- get_dupes(df)
+key_dupes <- df |> filter(!is.na(stamp)) |> get_dupes(stamp)
+cat('Лишних точных повторов:', sum(duplicated(df)), '\n')
+cat('Строк в группах точных повторов:', nrow(full_dupes), '\n')
+cat('Строк с повторной меткой:', nrow(key_dupes), '\n')
+kt(head(full_dupes, 10), 'Полные дубликаты (до 10 строк)')
+kt(head(key_dupes, 10), 'Дубликаты по времени (до 10 строк)')
+water_freq <- water |> count(Створ, sort = TRUE)
+kt(water_freq, 'Частоты по створам water.csv')
+kt(water |> count(Примечание, sort = TRUE), 'Частоты примечаний water.csv')
+kt(water |> get_dupes(ID), 'Дубликаты ID проб')
+```
+
+`get_dupes()` выводит все дубликаты и их количество повторов. В основном наборе `r sum(duplicated(df))` дубликатов и `r nrow(key_dupes)` их повторов.
+
+```{r explorer-overview}
+kt(introduce(df), 'Общая структура')
+plot_missing(df)
+```
+
+Таблица `introduce()` показывает размер датасета и полноту. Диаграмма `plot_missing()` показывает пропуски по каждому столбцу, наиболее неполный показатель — `r completeness$Столбец[1]`
+```{r auto-report}
+profile_data <- df |> mutate(stamp = format(stamp, '%Y-%m-%d %H:%M:%S', tz = 'UTC'))
+callr::r(function(data, out, pandoc_dir) {
+  Sys.setenv(RSTUDIO_PANDOC = pandoc_dir)
+  config <- list(introduce = list(), plot_intro = list(),
+                 plot_missing = list(), plot_histogram = list(),
+                 plot_density = list(),
+                 plot_correlation = list(type = 'continuous',
+                   cor_args = list(use = 'pairwise.complete.obs')))
+  DataExplorer::create_report(data,
+    output_format = rmarkdown::html_document(toc = TRUE, self_contained = TRUE),
+    output_file = 'profile.html', output_dir = out,
+    config = config,
+    quiet = TRUE)
+  invisible(TRUE)
+}, args = list(data = profile_data, out = getwd(),
+               pandoc_dir = rmarkdown::find_pandoc()$dir))
+```
+
+[Открыть отдельный отчёт profile.html](profile.html)
+
+# Чек-лист и план очистки
+
+## Профилирование
+
+| Проверка | Результат |
+|---|---|
+| Размер и типы | `r nrow(df)` строк, `r ncol(df)` столбцов; числовые измерения и даты |
+| Пропуски | `r sum(sentinel_counts$n)` скрытых кодов -200; `r sum(is.na(df))` NA после подготовки |
+| Диапазоны | `r nrow(invalid_ranges)` столбцов с нарушением заданных границ; `r sum(ranges$Выбросы > 0)` столбцов с флагами IQR |
+| Категории | В airquality нет отдельных категорий; в water.csv — `r nrow(water_freq)` створов |
+| Даты | `r sum(is.na(df$stamp))` непреобразованных дат |
+| Дубликаты | `r sum(duplicated(df))` лишних точных повторов и `r nrow(key_dupes)` строк с повторным временным ключом |
+| Согласованность | Проверены временная сетка, форматы, диапазон RH и обозначения пропусков; единицы измерения различаются |
+
+## Найденные проблемы и план очистки
+
+| № | Где | Проблема | Чем подтверждено | Измерение качества | Решение |
+|---|---|---|---|---|---|
+| 1 | AirQuality | Пустые строки | `r nrow(df_raw)-nrow(air_tidy)` строк | Валидность | Удалить пустые строки |
+| 2 | AirQuality | Пустые столбцы | `r ncol(df_raw)-ncol(air_tidy)` столбца | Валидность | Удалить пустые столбцы |
+| 3 | AirQuality | Скрытые пропуски (-200) | `r sum(sentinel_counts$n)` значений | Полнота | Заменить на NA при импорте |
+| 4 | `r completeness$Столбец[1]` | Большое количество пропусков | `r completeness$Доля[1]` % пропусков | Полнота | Определить способ обработки пропусков |
+| 5 | Date, Time | Раздельное хранение даты и времени, часовой пояс не указан | Структура исходных данных | Согласованность | Объединить в POSIXct, уточнить часовой пояс |
+| 6 | water.csv | Некорректная кодировка при импорте | Ошибка read_csv() | Валидность | Указать KOI8-R |
+| 7 | water.csv | Лишние служебные строки | Просмотр исходного файла | Валидность | Использовать skip и n_max |
+| 8 | pH, нитраты | Разные обозначения пропусков | Значения «-», «нет» | Согласованность | Уточнить их смысл и привести к единому формату |
+| 9 | AirQuality | Подозрительные значения | `r sum(ranges$Выбросы)` выбросов по IQR | Валидность | Проверить значения перед удалением |
+| 10 | Датчики PT08 | Возможная погрешность датчиков | Документация UCI | Точность (риск) | Проверить калибровку датчиков |
+
+## Вывод
+
+В ходе работы были выявлены основные проблемы данных, такие как пропуски, скрытые коды пропусков, неправильная кодировка и подозрительные значения. Наиболее серьёзной проблемой является большое количество пропусков, поскольку удаление неполных строк приведёт к потере большой части данных. Подозрительные значения требуют дополнительной проверки перед их исправлением
+
+# Контрольные вопросы
+
+**1. Какие измерения качества данных вы проверяли в этой работе и какими инструментами?**
+
+- Полнота — проверка пропусков (`skim()`, `vis_miss()`, `is.na()`)
+- Валидность — проверка типов и допустимых значений (`vis_dat()`, `vis_expect()`, `problems()`)
+- Уникальность — поиск дубликатов (`get_dupes()`, `duplicated()`)
+- Согласованность — проверка форматов и обозначений пропусков
+- Актуальность — проверка периода сбора данных
+- Точность — рассмотрение возможных ошибок датчиков
+
+**2. Почему `readr` может неверно определить тип столбца и как этого избежать?**
+
+`readr` определяет тип столбца на основе выборки значений, поэтому может не учесть данные, которые не попали в эту выборку. Чтобы избежать этого, необходимо явно задавать типы через `col_types`, параметры формата через `locale()`, обозначения пропусков через `na` и проверять ошибки импорта через `problems()`
+
+**3. Чем опасны скрытые коды пропусков вроде `-200`?**
+
+Такие значения воспринимаются как обычные числа и могут сильно повлиять на результаты расчётов. Поэтому при импорте их необходимо преобразовать в `NA`.
+
+**4. Почему `get_dupes()` не удаляет дубликаты автоматически?**
+
+Не все повторяющиеся записи являются ошибками. Функция только показывает дубликаты, а решение об их удалении принимается после анализа
+
+**5. Чем отличается нарушение структуры tidy data от некорректных значений в данных?**
+
+Tidy data относится к структуре таблицы, а некорректные значения относятся к содержимому таблицы. То есть таблица может иметь правильную структуру, но при этом содержать пропуски и ошибочные значения
