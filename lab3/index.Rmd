@@ -1,0 +1,96 @@
+---
+title: "Отслеживание загрязнения воздуха"
+author: "Забродин В.А., 02271-ДМ"
+lang: ru
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+    theme: flatly
+    code_folding: show
+---
+
+# Среднее значение загрязнителя
+
+```{r mean-function}
+getMean <- function(folder, type, id = 1:332) {
+  values <- lapply(id, function(i) {
+    data <- read.csv(file.path(folder, sprintf("%03d.csv", i)))
+    data[[type]]
+  })
+
+  mean(unlist(values), na.rm = TRUE)
+}
+```
+
+Функция читает файлы, объединяет значения выбранного загрязнителя и вычисляет среднее без учёта пропусков
+
+```{r mean-tests}
+getMean("data/raw", "sulfate", 1:10)
+getMean("data/raw", "nitrate", 70:72)
+getMean("data/raw", "nitrate", 23)
+```
+
+# Количество полных наблюдений
+
+```{r complete-function}
+getCompleteObservation <- function(folder, id = 1:332) {
+  counts <- sapply(id, function(i) {
+    data <- read.csv(file.path(folder, sprintf("%03d.csv", i)))
+    sum(complete.cases(data[, c("sulfate", "nitrate")]))
+  })
+
+  data.frame(id = id, count = counts)
+}
+```
+
+`complete.cases()` возвращает строки, в которых есть оба измерения
+
+```{r complete-tests}
+getCompleteObservation("data/raw", 1)
+getCompleteObservation("data/raw", c(2, 4, 8, 10, 12))
+getCompleteObservation("data/raw", 30:25)
+getCompleteObservation("data/raw", 3)
+```
+
+# Корреляция между сульфатами и нитратами
+
+```{r correlation-function}
+getCorrelation <- function(folder, limen = 0) {
+  files <- list.files(folder, pattern = "\\.csv$", full.names = TRUE)
+  result <- numeric(0)
+
+  for (file in files) {
+    data <- read.csv(file)
+    data <- data[complete.cases(data), ]
+
+    if (nrow(data) > limen) {
+      result <- c(result, cor(data$sulfate, data$nitrate))
+    }
+  }
+
+  result
+}
+```
+
+Функция оставляет только полные наблюдения и рассчитывает корреляцию Пирсона, если количество наблюдений больше заданного порога
+
+```{r correlation-tests}
+res <- getCorrelation("data/raw", 150)
+head(res)
+summary(res)
+
+res <- getCorrelation("data/raw", 400)
+head(res)
+summary(res)
+
+res <- getCorrelation("data/raw", 5000)
+summary(res)
+length(res)
+
+res <- getCorrelation("data/raw")
+summary(res)
+length(res)
+```
